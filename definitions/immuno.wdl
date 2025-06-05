@@ -107,7 +107,7 @@ workflow immuno {
 
     File kallisto_index
     File gene_transcript_lookup_table
-    String? strand  # [first, second, unstranded]
+    String strand  # [first, second, unstranded]
     File refFlat
     File ribosomal_intervals
     File star_fusion_genome_dir_zip

@@ -1,13 +1,15 @@
 version 1.0
 
-import "../subworkflows/bam_readcount.wdl" as br
-import "../subworkflows/vcf_readcount_annotator.wdl" as vra
-import "../tools/vcf_expression_annotator.wdl" as vea
-import "../tools/index_vcf.wdl" as iv
-import "../tools/regtools.wdl" as reg
-import "../tools/pvacsplice.wdl" as pspl
-
-
+# Get rid of "../" if running pvacsplice wdl alone
+import "subworkflows/bam_readcount.wdl" as br
+import "subworkflows/vcf_readcount_annotator.wdl" as vra
+import "tools/vcf_expression_annotator.wdl" as vea
+import "tools/index_vcf.wdl" as iv
+import "tools/regtools.wdl" as reg
+import "tools/pvacsplice.wdl" as pspl
+import "tools/check_file_annotated.wdl" as cfa
+import "tools/get_size_gb.wdl" as gsgb
+import "tools/validate_file_types.wdl" as vft
 workflow pvacsplice {
   input {
     File detect_variants_vcf 
@@ -30,7 +32,7 @@ workflow pvacsplice {
     String output_filename_tsv
     String? output_filename_vcf
     String? output_filename_bed
-    String? strand
+    String strand
     Int? window_size
     Int? max_distance_exon 
     Int? max_distance_intron
@@ -78,52 +80,95 @@ workflow pvacsplice {
     Array[String]? junction_anchor_types
     Boolean? keep_tmp_files 
   }
-
-  call br.bamReadcount as tumorRnaBamReadcount {
+  # Conditions for early break:
+  
+  # Double check all required files exist with proper file types:
+  call vft.validate_file_types as val_ft {
     input:
-    vcf=detect_variants_vcf,
-    vcf_tbi=detect_variants_vcf_tbi,
-    sample=sample_name,
-    reference=reference,
-    reference_fai=reference_fai,
-    reference_dict=reference_dict,
-    bam=rnaseq_bam,
-    bam_bai=rnaseq_bam_bai,
-    min_base_quality=readcount_minimum_base_quality,
-    min_mapping_quality=readcount_minimum_mapping_quality
+    files=[
+      detect_variants_vcf, 
+      detect_variants_vcf_tbi, 
+      rnaseq_bam, 
+      rnaseq_bam_bai,
+      reference,
+      reference_fai,
+      reference_dict,
+      gene_expression_file,
+      transcript_expression_file,
+      reference_annotation
+    ],
+    filetypes=[
+      ".vcf.gz",
+      ".vcf.gz.tbi",
+      ".bam",
+      ".bam.bai",
+      ".fa",
+      ".fa.fai",
+      ".dict",
+      ".vcf.gz",
+      ".vcf.gz.tbi",
+      ".gtf"
+    ]
   }
 
-  call vra.vcfReadcountAnnotator as addTumorRnaBamReadcountToVcf {
+  # Currently has error if it is annotated
+  # Need to find out how to 
+  # Annotated has: GX, TX and GT in format header
+  call cfa.check_annotated as check_annotated {
     input:
-    vcf=tumorRnaBamReadcount.normalized_vcf,
-    snv_bam_readcount_tsv=tumorRnaBamReadcount.snv_bam_readcount_tsv,
-    indel_bam_readcount_tsv=tumorRnaBamReadcount.indel_bam_readcount_tsv,
-    data_type="RNA",
-    sample_name=sample_name
+    vcf_file=detect_variants_vcf
   }
 
-  call vea.vcfExpressionAnnotator as addGeneExpressionDataToVcf {
-    input:
-    vcf=addTumorRnaBamReadcountToVcf.annotated_bam_readcount_vcf,
-    expression_file=gene_expression_file,
-    expression_tool=expression_tool,
-    data_type="gene",
-    sample_name=sample_name
-  }
+  if (!check_annotated.is_annotated) {
+    call br.bamReadcount as tumorRnaBamReadcount {
+      input:
+      vcf=detect_variants_vcf,
+      vcf_tbi=detect_variants_vcf_tbi,
+      sample=sample_name,
+      reference=reference,
+      reference_fai=reference_fai,
+      reference_dict=reference_dict,
+      bam=rnaseq_bam,
+      bam_bai=rnaseq_bam_bai,
+      min_base_quality=readcount_minimum_base_quality,
+      min_mapping_quality=readcount_minimum_mapping_quality
+    }
+    call vra.vcfReadcountAnnotator as addTumorRnaBamReadcountToVcf {
+      input:
+      vcf=tumorRnaBamReadcount.normalized_vcf,
+      snv_bam_readcount_tsv=tumorRnaBamReadcount.snv_bam_readcount_tsv,
+      indel_bam_readcount_tsv=tumorRnaBamReadcount.indel_bam_readcount_tsv,
+      data_type="RNA",
+      sample_name=sample_name
+    }
 
-  call vea.vcfExpressionAnnotator as addTranscriptExpressionDataToVcf {
-    input:
-    vcf=addGeneExpressionDataToVcf.annotated_expression_vcf,
-    expression_file=transcript_expression_file,
-    expression_tool=expression_tool,
-    data_type="transcript",
-    sample_name=sample_name
-  }
-
+    call vea.vcfExpressionAnnotator as addGeneExpressionDataToVcf {
+      input:
+      vcf=addTumorRnaBamReadcountToVcf.annotated_bam_readcount_vcf,
+      expression_file=gene_expression_file,
+      expression_tool=expression_tool,
+      data_type="gene",
+      sample_name=sample_name
+    }
+    
+    call vea.vcfExpressionAnnotator as addTranscriptExpressionDataToVcf {
+      input:
+      vcf=addGeneExpressionDataToVcf.annotated_expression_vcf,
+      expression_file=transcript_expression_file,
+      expression_tool=expression_tool,
+      data_type="transcript",
+      sample_name=sample_name
+    }
+    
+    
+  } 
   call iv.indexVcf as index {
-    input: vcf=addTranscriptExpressionDataToVcf.annotated_expression_vcf
+    input: vcf=select_first([addTranscriptExpressionDataToVcf.annotated_expression_vcf, detect_variants_vcf])
   }
-
+  call gsgb.get_size_gb as getsize {
+    input:
+    files=[index.indexed_vcf, rnaseq_bam, reference, reference_annotation, rnaseq_bam_bai]
+  }
   call reg.regtools as runregtools {
     input:
     output_filename_tsv=output_filename_tsv,
@@ -140,10 +185,15 @@ workflow pvacsplice {
     intron_motif_priority=intron_motif_priority,
     input_vcf=index.indexed_vcf,
     input_bam=rnaseq_bam,
+    input_bam_bai=rnaseq_bam_bai,
     input_reference_dna_fasta=reference,
-    input_reference_gtf=reference_annotation
+    input_reference_gtf=reference_annotation,
+    space_needed_gb=getsize.size
   }
-
+  call gsgb.get_size_gb as getsize_pvacsplice {
+    input:
+    files=[index.indexed_vcf, index.indexed_vcf_tbi, runregtools.output_splice_junction_tsv, reference, reference_annotation]
+  }
   call pspl.pvacsplice as runpvacsplice {
     input:
     n_threads=n_threads,
@@ -188,9 +238,9 @@ workflow pvacsplice {
     keep_tmp_files=keep_tmp_files,
     netmhc_stab=netmhc_stab,
     run_reference_proteome_similarity=run_reference_proteome_similarity,
-    tumor_purity=tumor_purity
+    tumor_purity=tumor_purity,
+    space_needed_gb=getsize_pvacsplice.size
   }
-
 
   output {
     File annotated_vcf = index.indexed_vcf
